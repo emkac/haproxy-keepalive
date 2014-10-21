@@ -1,0 +1,190 @@
+Haute disponibilité du serveur de loadbalancing haproxy
+
+Haproxy est un proxy TCP/HTTP inverse qui permet de :
+
+Router les requêtes HTTP en fonction des cookies attribuées de manière statique.
+
+Répartir la charge entre plusieurs serveurs tout en assurant la persistance du serveur par l'utilisation de cookies HTTP.
+
+Basculer sur un serveurs de sauvegarde en cas un principal échoue.
+
+Maintenir des clients sur le serveur application en fonction de cookies applicatifs.
+
+gérer des milliers de connexions simultanées sur des centaines de cas sans risquer la stabilité du système.
+
+Un keepalive (KA) est un message envoyé par un périphérique à un autre pour vérifier que le lien entre les deux est en fonctionnement ou est interompue.
+
+si le lien est interrompue, le périphérique défini comme esclave prendre la place du maître le temps que le maître soit de nouveau joignable.
+Prérequis matériel et os
+
+Pour la réalisation de ce wiki, nous utiliserons deux serveurs debian7 ( kvm) et deux autres serveurs (openvz ) qui feront office de serveurs web.
+
+serveur haproxy1 10.100.30.146 user root/smileci
+
+serveur haproxy 2 10.100.30.147 user root/smileci
+
+serveur web 1 10.100.30.149 user root/smileci
+
+serveur web 2 10.100.30.142 user root/smileci
+
+adresse ip virtuel qui servira d'intermediaire entre nos clients et les serveurs webs 10.100.30.144
+Mise en service des serveurs webs
+
+Pour plus de securité, il est preferable que le serveur web nous fornisse l'adresse ip du client qui lui demande des requêtes plutôt que l'adresse virtuel qui sert a réaliser le loadbalancing.
+
+Pour cela, il faut editer le fichier de configuration des serveurs webs
+
+vi /etc/apache2/apache2.conf
+
+Rechercher la ligne commençant par LogFormat "%h et se terminant par combined puis remplacer la lettre h par l’expression {X-Forwarded-For}
+
+LogFormat "%{X-Forwarded-For}i %l %u %t \"%r\" %>s %b \"%{Referer}i\" \"%{User-Agent}i\"" combined
+
+Ensuite , il faut permettre au loadbalancer de vérifier constamment la nature du serveur web .
+
+vi /etc/apache2/site-available/default
+SetEnvIf Request_URI "^/check\.txt$" dontlog 
+CustomLog /var/log/apache2/access.log combined env=!dontlog 
+
+Pour finir, il faut créer un fichier vide dans lequel les requêtes seront répertorier
+
+touch /var/www/check.txt
+
+Mise en place de la haute disponibilité des serveurs haproxy
+
+Sauf mention spécifiques, les taches suivantes sont a réalisées sur les différents serveurs haproxy
+Installation de haproxy
+
+echo " deb http://cdn.debian.net/debian wheezy-backports main" | tee /etc/apt/source.list.d/backports.list
+curl http://haproxy.debian.net/bernat.debian.org.gpg |  sudo apt-key add - 
+echo " deb http://haproxy.debian.net wheezy-backports main" | tee /etc/apt/sources.list.d/haproxy.list
+apt-get update 
+apt-get install haproxy -t wheezy-backports 
+
+Configuration de haproxy
+
+cp /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg_orig 
+cat /dev/null > /etc/haproxy/haproxy.cfg
+
+vi /etc/haproxy/haproxy.cfg
+
+#global directive global         
+log 127.0.0.1   
+local0         
+log 127.0.0.1   
+local1 notice         
+#log loghost    
+local0 info         
+maxconn 4096         
+#debug         
+ #quiet         
+ user haproxy         
+ group haproxy    
+ 
+ #default directive 
+defaults         
+log     
+global         
+mode    
+http         
+option  httplog         
+option  dontlognull         
+retries 3         
+redispatch         
+maxconn 2000         
+contimeout      5000         
+clitimeout      50000         
+srvtimeout      50000 
+
+#listening directive 
+listen loadbalancing 10.100.30.144:80        
+mode http        
+stats enable        
+stats auth someuser:somepassword        
+balance roundrobin        
+cookie JSESSIONID prefix        
+option httpclose        
+option forwardfor        
+option httpchk HEAD /check.txt HTTP/1.0        
+server webA 10.100.30.149:80 cookie A check        
+server webB 10.100.30.146:80 cookie B check
+
+Installation de keepalived
+
+apt-get install keepalived 
+echo "net.ipv4.ip_nonlocal_bind=1" >> /etc/sysctl.conf 
+sysctl -p
+
+Configuration de keepalived serveur haproxy 1
+
+vi /etc/keepalived/keepalived.conf
+
+creer le fichier s'il n'est pas present par defaut
+
+vrrp_script chk_haproxy {           # Requires keepalived-1.1.13         
+script "killall -0 haproxy"     # cheaper than pidof         
+interval 2                      # check every 2 seconds         
+weight 2                        # add 2 points of prio if OK 
+}
+
+vrrp_instance VI_1 {         
+interface eth0         
+state MASTER         
+virtual_router_id 51         
+priority 101                    # 101 on master, 100 on backup         
+virtual_ipaddress {             
+10.100.30.144        # @ virtuel sur lequel ecoute haproxy         
+}         
+track_script {             
+chk_haproxy         
+}
+ }
+
+Configuration de keepalived serveur haproxy 2
+
+vi /etc/keepalived/keepalived.conf
+
+Créer le fichier s'il n'est pas présent par défaut
+
+vrrp_script chk_haproxy {           # Requires keepalived-1.1.13         
+script "killall -0 haproxy"     # cheaper than pidof         
+interval 2                      # check every 2 seconds         
+weight 2                        # add 2 points of prio if OK 
+}
+
+vrrp_instance VI_1 {         
+interface eth0         
+state MASTER         
+virtual_router_id 51         
+priority 100                   # 101 on master, 100 on backup         
+virtual_ipaddress {             
+10.100.30.144        # @ virtuel sur lequel ecoute haproxy         
+}         
+track_script {             
+chk_haproxy         
+}
+ }
+
+Test de fonctionnalité
+
+Lancer la commande ip addr sh eth0 sur les deux serveurs loadbalancing pour tester le bon fonctionnement de la solution.
+
+root@SG1:~# ip addr sh eth0 
+2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast state UP qlen 1000     
+link/ether c2:75:f6:47:df:78 brd ff:ff:ff:ff:ff:ff    
+ inet 10.100.30.146/24 brd 10.100.30.255 scope global eth0     
+inet 10.100.30.144/32 scope global eth0     
+inet6 fe80::c075:f6ff:fe47:df78/64 scope link         
+valid_lft forever preferred_lft forever
+
+root@haproxy2:~# ip addr sh eth0 
+2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast state UP qlen 1000     
+link/ether 8a:e4:35:29:3f:60 brd ff:ff:ff:ff:ff:ff     
+inet 10.100.30.147/24 brd 10.100.30.255 scope global eth0     
+inet6 fe80::88e4:35ff:fe29:3f60/64 scope link         
+valid_lft forever preferred_lft forever 
+root@haproxy2:~# 
+
+On constate qu'en plus de son adresse ip 10.100.30.146 , le serveur haproxy primaire dispose d'une adresse virtuel 10.100.30.144 . cette adresse est l'adresse de loadbalancing.
+
+Lorsque le service haproxy est interrompue sur le serveur primaire, le secondaire prend automatiquement la place du primaire afin d'assurer la continuité du service. 
